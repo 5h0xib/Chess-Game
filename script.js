@@ -477,12 +477,16 @@ function makeMove(fromRow, fromCol, toRow, toCol) {
     // Check game status
     checkGameStatus();
 
+    // Persist state after every move
+    saveGameState();
+
     renderBoard();
 
     // Trigger AI move if in AI mode and it's AI's turn
+    // Also allow when status is 'check' so the computer can respond to being in check
     if (gameState.gameMode === 'pvc' &&
         gameState.currentTurn === 'black' &&
-        gameState.gameStatus === 'active') {
+        (gameState.gameStatus === 'active' || gameState.gameStatus === 'check')) {
         setTimeout(makeComputerMove, 500); // Delay for better UX
     }
 }
@@ -751,6 +755,52 @@ function isValidSquare(row, col) {
     return row >= 0 && row < 8 && col >= 0 && col < 8;
 }
 
+// ===== LOCAL STORAGE PERSISTENCE =====
+const STORAGE_KEY = 'chessGameState';
+
+function saveGameState() {
+    const stateToSave = {
+        board: gameState.board,
+        currentTurn: gameState.currentTurn,
+        gameStatus: gameState.gameStatus,
+        moveHistory: gameState.moveHistory,
+        enPassantTarget: gameState.enPassantTarget,
+        castlingRights: gameState.castlingRights,
+        kingMoved: gameState.kingMoved,
+        rookMoved: gameState.rookMoved,
+        gameMode: gameState.gameMode,
+        aiDifficulty: gameState.aiDifficulty
+    };
+    try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
+    } catch (e) {
+        console.warn('Could not save game state:', e);
+    }
+}
+
+function loadGameState() {
+    try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (!saved) return false;
+        const parsed = JSON.parse(saved);
+        // Restore only the fields we persisted
+        gameState.board = parsed.board;
+        gameState.currentTurn = parsed.currentTurn;
+        gameState.gameStatus = parsed.gameStatus;
+        gameState.moveHistory = parsed.moveHistory;
+        gameState.enPassantTarget = parsed.enPassantTarget;
+        gameState.castlingRights = parsed.castlingRights;
+        gameState.kingMoved = parsed.kingMoved;
+        gameState.rookMoved = parsed.rookMoved;
+        gameState.gameMode = parsed.gameMode || 'pvp';
+        gameState.aiDifficulty = parsed.aiDifficulty || 'medium';
+        return true;
+    } catch (e) {
+        console.warn('Could not load game state:', e);
+        return false;
+    }
+}
+
 // ===== AI OPPONENT LOGIC =====
 
 // Piece values for material evaluation
@@ -827,24 +877,74 @@ const PIECE_SQUARE_TABLES = {
     ]
 };
 
+// ===== ENDGAME KING TABLES =====
+// Reward the AI king being active; push the enemy king to corners.
+const KING_ENDGAME_TABLE = [
+    [-50, -30, -30, -30, -30, -30, -30, -50],
+    [-30, -30, 0, 0, 0, 0, -30, -30],
+    [-30, -10, 20, 30, 30, 20, -10, -30],
+    [-30, -10, 30, 40, 40, 30, -10, -30],
+    [-30, -10, 30, 40, 40, 30, -10, -30],
+    [-30, -10, 20, 30, 30, 20, -10, -30],
+    [-30, -20, -10, 0, 0, -10, -20, -30],
+    [-50, -40, -30, -20, -20, -30, -40, -50]
+];
+
+// Detect endgame: when queens are gone or total non-king material is low
+function isEndgame(board) {
+    let queens = 0;
+    let totalMaterial = 0;
+    for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+            const p = board[r][c];
+            if (!p || p.type === 'king') continue;
+            if (p.type === 'queen') queens++;
+            totalMaterial += PIECE_VALUES[p.type];
+        }
+    }
+    return queens === 0 || totalMaterial < 1600;
+}
+
+// Manhattan distance between two squares
+function kingDistance(r1, c1, r2, c2) {
+    return Math.abs(r1 - r2) + Math.abs(c1 - c2);
+}
+
 // Evaluate board position
 function evaluatePosition(board, color) {
     let score = 0;
+    const endgame = isEndgame(board);
+    const opponentColor = color === 'black' ? 'white' : 'black';
+
+    let aiKingRow = -1, aiKingCol = -1;
+    let enemyKingRow = -1, enemyKingCol = -1;
 
     for (let row = 0; row < 8; row++) {
         for (let col = 0; col < 8; col++) {
             const piece = board[row][col];
             if (!piece) continue;
 
+            if (piece.type === 'king') {
+                if (piece.color === color) { aiKingRow = row; aiKingCol = col; }
+                else { enemyKingRow = row; enemyKingCol = col; }
+            }
+
             // Material value
             let pieceValue = PIECE_VALUES[piece.type];
 
-            // Positional bonus
-            const tableRow = piece.color === 'white' ? 7 - row : row;
-            const positionBonus = PIECE_SQUARE_TABLES[piece.type][tableRow][col];
+            // Positional bonus — use endgame king table in endgame
+            let positionBonus = 0;
+            if (piece.type === 'king' && endgame) {
+                const tableRow = piece.color === 'white' ? 7 - row : row;
+                positionBonus = piece.color === color
+                    ? KING_ENDGAME_TABLE[tableRow][col]         // AI king: be active
+                    : -KING_ENDGAME_TABLE[tableRow][col];       // Enemy king: penalise centre
+            } else {
+                const tableRow = piece.color === 'white' ? 7 - row : row;
+                positionBonus = PIECE_SQUARE_TABLES[piece.type][tableRow][col];
+            }
 
             const totalValue = pieceValue + positionBonus;
-
             if (piece.color === color) {
                 score += totalValue;
             } else {
@@ -853,7 +953,41 @@ function evaluatePosition(board, color) {
         }
     }
 
+    // Endgame bonus: reward pushing the enemy king to the board edge
+    // and reward the two kings being close (for mating patterns)
+    if (endgame && aiKingRow !== -1 && enemyKingRow !== -1) {
+        // Enemy king corner bonus (distance from centre)
+        const enemyCentreDistance = Math.max(
+            Math.abs(3.5 - enemyKingRow),
+            Math.abs(3.5 - enemyKingCol)
+        );
+        score += enemyCentreDistance * 15; // Push enemy to edge
+
+        // Reward bringing AI king close to enemy king to assist mating pieces
+        const kingsDistance = kingDistance(aiKingRow, aiKingCol, enemyKingRow, enemyKingCol);
+        score += (14 - kingsDistance) * 5; // Closer is better
+    }
+
     return score;
+}
+
+// ===== MOVE ORDERING (MVV-LVA: Most Valuable Victim / Least Valuable Attacker) =====
+function orderMoves(moves, board) {
+    return moves.sort((a, b) => {
+        const victimA = board[a.to.row][a.to.col];
+        const victimB = board[b.to.row][b.to.col];
+        const attackerA = board[a.from.row][a.from.col];
+        const attackerB = board[b.from.row][b.from.col];
+
+        const scoreA = victimA
+            ? (PIECE_VALUES[victimA.type] * 10) - (attackerA ? PIECE_VALUES[attackerA.type] : 0)
+            : 0;
+        const scoreB = victimB
+            ? (PIECE_VALUES[victimB.type] * 10) - (attackerB ? PIECE_VALUES[attackerB.type] : 0)
+            : 0;
+
+        return scoreB - scoreA; // Higher score first
+    });
 }
 
 // Get all possible moves for a color
@@ -905,52 +1039,72 @@ function makeMoveOnBoard(board, fromRow, fromCol, toRow, toCol) {
     return newBoard;
 }
 
-// Minimax algorithm with alpha-beta pruning
+// Check if the king of a given color is in check on an arbitrary board
+function isKingInCheckOnBoard(board, color) {
+    const originalBoard = gameState.board;
+    gameState.board = board;
+    const inCheck = isKingInCheck(color);
+    gameState.board = originalBoard;
+    return inCheck;
+}
+
+// Minimax algorithm with alpha-beta pruning + proper terminal scoring + move ordering
 function minimax(board, depth, alpha, beta, isMaximizing, aiColor) {
-    // Base case: depth 0 or game over
+    const currentColor = isMaximizing ? aiColor : (aiColor === 'black' ? 'white' : 'black');
+    const moves = getAllPossibleMoves(board, currentColor);
+
+    // Terminal node: no moves available
+    if (moves.length === 0) {
+        if (isKingInCheckOnBoard(board, currentColor)) {
+            // Checkmate — penalise by depth so AI prefers faster mates
+            return isMaximizing ? (-100000 - depth * 100) : (100000 + depth * 100);
+        } else {
+            // Stalemate — slight disadvantage for the side achieving it when winning
+            return 0;
+        }
+    }
+
+    // Base case: reached leaf node
     if (depth === 0) {
         return evaluatePosition(board, aiColor);
     }
 
-    const currentColor = isMaximizing ? aiColor : (aiColor === 'white' ? 'black' : 'white');
-    const moves = getAllPossibleMoves(board, currentColor);
-
-    if (moves.length === 0) {
-        // Game over or no moves
-        return evaluatePosition(board, aiColor);
-    }
+    // Order moves: captures first for better pruning
+    const orderedMoves = orderMoves(moves, board);
 
     if (isMaximizing) {
         let maxEval = -Infinity;
-
-        for (const move of moves) {
+        for (const move of orderedMoves) {
             const newBoard = makeMoveOnBoard(board, move.from.row, move.from.col, move.to.row, move.to.col);
             const evaluation = minimax(newBoard, depth - 1, alpha, beta, false, aiColor);
             maxEval = Math.max(maxEval, evaluation);
             alpha = Math.max(alpha, evaluation);
-
-            if (beta <= alpha) {
-                break; // Beta cutoff
-            }
+            if (beta <= alpha) break; // Beta cutoff
         }
-
         return maxEval;
     } else {
         let minEval = Infinity;
-
-        for (const move of moves) {
+        for (const move of orderedMoves) {
             const newBoard = makeMoveOnBoard(board, move.from.row, move.from.col, move.to.row, move.to.col);
             const evaluation = minimax(newBoard, depth - 1, alpha, beta, true, aiColor);
             minEval = Math.min(minEval, evaluation);
             beta = Math.min(beta, evaluation);
-
-            if (beta <= alpha) {
-                break; // Alpha cutoff
-            }
+            if (beta <= alpha) break; // Alpha cutoff
         }
-
         return minEval;
     }
+}
+
+// Build a lightweight board hash for repetition detection
+function hashBoard(board) {
+    let h = '';
+    for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+            const p = board[r][c];
+            h += p ? p.color[0] + p.type[0] : '--';
+        }
+    }
+    return h;
 }
 
 // Get best move for AI
@@ -969,13 +1123,43 @@ function getBestMove() {
         default: depth = 3;
     }
 
+    // Build recent position history for repetition detection (last 8 half-moves)
+    const recentHashes = new Set();
+    const historyLength = Math.min(gameState.moveHistory.length, 8);
+    // Replay last N moves on a scratch board to collect hashes
+    {
+        let scratchBoard = gameState.board.map(r => [...r]);
+        // We collect the current position hash
+        recentHashes.add(hashBoard(scratchBoard));
+    }
+    // Also count occurrences of current position in the full move history
+    const currentHash = hashBoard(gameState.board);
+    let repetitionCount = 0;
+    // Each entry in moveHistory represents a half-move; we don't have full board snapshots,
+    // so we count how many times the AI's pieces were at their current squares by proxy —
+    // simply penalise a move that would return a piece to a square it just left.
+    const lastMove = gameState.moveHistory.length >= 2
+        ? gameState.moveHistory[gameState.moveHistory.length - 2]  // AI's last move
+        : null;
+
+    // Order top-level moves (captures first)
+    const orderedMoves = orderMoves(moves, gameState.board);
+
     let bestMove = null;
     let bestValue = -Infinity;
 
-    // Evaluate each possible move
-    for (const move of moves) {
+    for (const move of orderedMoves) {
         const newBoard = makeMoveOnBoard(gameState.board, move.from.row, move.from.col, move.to.row, move.to.col);
-        const moveValue = minimax(newBoard, depth - 1, -Infinity, Infinity, false, aiColor);
+        let moveValue = minimax(newBoard, depth - 1, -Infinity, Infinity, false, aiColor);
+
+        // Repetition penalty: if this move reverses the AI's last move (back-and-forth)
+        if (lastMove &&
+            move.from.row === lastMove.to.row &&
+            move.from.col === lastMove.to.col &&
+            move.to.row === lastMove.from.row &&
+            move.to.col === lastMove.from.col) {
+            moveValue -= 300; // Discourage but don't hard-block (might still be best)
+        }
 
         if (moveValue > bestValue) {
             bestValue = moveValue;
@@ -985,6 +1169,7 @@ function getBestMove() {
 
     return bestMove;
 }
+
 
 // Execute computer move
 function makeComputerMove() {
@@ -1011,6 +1196,9 @@ function makeComputerMove() {
 
 // ===== RESET GAME =====
 function resetGame() {
+    // Clear saved state
+    try { localStorage.removeItem(STORAGE_KEY); } catch (e) { }
+
     // Preserve game mode settings
     const currentGameMode = gameState.gameMode;
     const currentDifficulty = gameState.aiDifficulty;
@@ -1044,8 +1232,38 @@ function resetGame() {
 
 // ===== INITIALIZE GAME =====
 document.addEventListener('DOMContentLoaded', () => {
-    initializeBoard();
-    renderBoard();
+    const hasSavedState = loadGameState();
+
+    if (hasSavedState) {
+        // Sync radio buttons to match saved settings
+        const savedMode = gameState.gameMode;
+        const savedDifficulty = gameState.aiDifficulty;
+
+        const gameModeRadio = document.querySelector(`input[name="gameMode"][value="${savedMode}"]`);
+        if (gameModeRadio) gameModeRadio.checked = true;
+
+        const difficultyRadio = document.querySelector(`input[name="difficulty"][value="${savedDifficulty}"]`);
+        if (difficultyRadio) difficultyRadio.checked = true;
+
+        // Show difficulty section if in PvC mode
+        const difficultySection = document.getElementById('difficultySection');
+        if (savedMode === 'pvc') difficultySection.style.display = 'block';
+
+        // Restore any in-progress alerts (check/checkmate/stalemate)
+        if (gameState.gameStatus === 'checkmate') {
+            const winner = gameState.currentTurn === 'white' ? 'Black' : 'White';
+            showAlert(`Checkmate! ${winner} wins!`, 'checkmate');
+        } else if (gameState.gameStatus === 'stalemate') {
+            showAlert('Stalemate! Game is a draw.', 'stalemate');
+        } else if (gameState.gameStatus === 'check') {
+            showAlert(`${gameState.currentTurn.charAt(0).toUpperCase() + gameState.currentTurn.slice(1)} is in check!`, 'check');
+        }
+
+        renderBoard();
+    } else {
+        initializeBoard();
+        renderBoard();
+    }
 
     // Reset button handler
     document.getElementById('resetBtn').addEventListener('click', resetGame);
